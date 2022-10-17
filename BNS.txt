@@ -1,0 +1,603 @@
+package app
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/BandaiNamcoStudios-Workshop/server-workshop/internal/auth"
+	"github.com/BandaiNamcoStudios-Workshop/server-workshop/internal/session"
+)
+
+// API API を表す構造体。
+type API struct {
+	// now 現在時刻を取得するための関数
+	now func() time.Time
+	// auth 認証サービス
+	auth auth.Auth
+	// db データベースハンドラ
+	db *sql.DB
+
+	// middlewares API で使用する HTTP ミドルウェア
+	middlewares []func(http.Handler) http.Handler
+}
+
+// NewAPI API を生成して返す。
+func NewAPI(now func() time.Time, auth auth.Auth, db *sql.DB) *API {
+	return &API{
+		now:         now,
+		auth:        auth,
+		db:          db,
+		middlewares: make([]func(http.Handler) http.Handler, 0),
+	}
+}
+
+// Use HTTP ミドルウェアを追加する。
+func (s *API) Use(middlewares ...func(http.Handler) http.Handler) {
+	s.middlewares = append(s.middlewares, middlewares...)
+}
+
+// Handler API 実装を提供する http.Handler を返す。
+func (s *API) Handler() http.Handler {
+	r := chi.NewRouter()
+
+	r.Use(s.middlewares...)
+	r.Use(
+		allowContentTypeMiddleware("application/json"),
+		middleware.RequestID,
+		middleware.SetHeader("Content-Type", "application/json"),
+	)
+
+	r.Post("/ping", s.pingHandler)
+
+	r.Post("/auth/user", s.authUserHandler)
+	r.Post("/auth/admin", s.authAdminHandler)
+
+	r.Post("/saveResult", s.saveResultHandler)
+	r.Post("/getOwnAchievements", s.getOwnAchievementsHandler)
+
+	r.Post("/getLatestUsers", s.getLatestUsersHandler)
+	r.Post("/searchUsers", s.searchUsersHandler)
+	r.Post("/getUserData", s.getUserDataHandler)
+	r.Post("/getUserAchievements", s.getUserAchievementsHandler)
+	r.Post("/getUserPlayHistory", s.getUserPlayHistoryHandler)
+
+	r.Post("/getScoreRanking", s.getScoreRankingHandler)
+	r.Post("/getDepthRanking", s.getDepthRankingHandler)
+
+	r.NotFound(s.notFound)
+	r.MethodNotAllowed(s.methodNotAllowed)
+
+	return r
+}
+
+// PingRequest ping リクエストを表す。
+type PingRequest struct {
+	// Message 任意の文字列
+	Message string `json:"message"`
+}
+
+// PingResponse ping レスポンスを表す。
+type PingResponse struct {
+	// Message 受信した文字列
+	Message string `json:"message"`
+	// ReceivedTime サーバー受信時刻
+	ReceivedTime time.Time `json:"receivedTime"`
+}
+
+// pingHandler 疎通確認 API の HTTP ハンドラ。
+func (s *API) pingHandler(w http.ResponseWriter, r *http.Request) {
+	// 受信時刻を取得する。
+	// 現在時刻を参照するときは time.Now() ではなく、s.now() を使用するようにする。
+	// これにより単体テスト等で時刻を偽装することが容易になる。
+	receivedTime := s.now()
+
+	// リクエストボディをデコードする。
+	req := &PingRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// デコードに失敗した場合はログ出力して 400 Bad Request を返す。
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	// レスポンスボディを表す構造体を生成する。
+	resp := &PingResponse{
+		Message:      req.Message,
+		ReceivedTime: receivedTime,
+	}
+
+	// レスポンスボディをエンコードする。
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		// エンコードに失敗した場合はログ出力して 500 Internal Server Error を返す。
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+// AuthUserRequest ユーザー認証リクエストを表す。
+type AuthUserRequest struct {
+	// Username ユーザー名
+	Username string `json:"username"`
+}
+
+// AuthUserResponse ユーザー認証レスポンスを表す。
+type AuthUserResponse struct {
+	// SessionID セッション ID
+	SessionID string `json:"sessionId"`
+	// SessionToken セッショントークン
+	SessionToken string `json:"sessionToken"`
+	// UserID ユーザー ID
+	UserID int32 `json:"userId"`
+	// IsNewUser 新規作成ユーザーか否か
+	IsNewUser bool `json:"isNewUser"`
+	// PlayCount プレイ回数
+	PlayCount int32 `json:"playCount"`
+	// HighScore ハイスコア
+	HighScore int32 `json:"highScore"`
+	// MaxDepth DEPTH の最高記録
+	MaxDepth int32 `json:"maxDepth"`
+}
+
+// authUserHandler ユーザー認証 API の HTTP ハンドラ。
+func (s *API) authUserHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	req := &AuthUserRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	if req.Username == "" {
+		writeErrorResponse(w, http.StatusBadRequest, "missing username")
+		return
+	}
+
+	var userID int32
+	var isNewUser bool
+	var playCount, highScore, maxDepth int32
+
+	row := s.db.QueryRowContext(ctx,
+		"SELECT id, play_count, high_score, max_depth FROM users WHERE name = ?", req.Username)
+	if err := row.Scan(&userID, &playCount, &highScore, &maxDepth); errors.Is(sql.ErrNoRows, err) {
+		// ユーザーが存在しない場合は新規作成する。
+		now := s.now()
+		if _, err := s.db.ExecContext(ctx,
+			//nolint:lll
+			"INSERT INTO users (name, created_at, updated_at) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM users WHERE name = ?)",
+			req.Username, now, now, req.Username); err != nil {
+			log.Printf("[ERROR] failed to create new user: %+v", err)
+			writeHTTPError(w, http.StatusInternalServerError)
+			return
+		}
+
+		row := s.db.QueryRowContext(ctx, "SELECT id, high_score, max_depth FROM users WHERE name = ?", req.Username)
+		if err := row.Scan(&userID, &highScore, &maxDepth); err != nil {
+			log.Printf("[ERROR] failed to get new user: %+v", err)
+			writeHTTPError(w, http.StatusInternalServerError)
+			return
+		}
+
+		isNewUser = true
+	} else if err != nil {
+		log.Printf("[ERROR] failed to get user: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	now := s.now()
+	sessID, token, err := s.auth.NewSessionToken(session.ClientTypeUser, session.ToClientID(userID), now)
+	if err != nil {
+		log.Printf("[ERROR] failed to generate session token: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		"UPDATE users SET session_id = ?, last_logged_in_at = ?, updated_at = ? WHERE id = ?",
+		sessID, now, now, userID); err != nil {
+		log.Printf("[ERROR] failed to update user: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	resp := &AuthUserResponse{
+		SessionID:    sessID,
+		SessionToken: token,
+		UserID:       userID,
+		IsNewUser:    isNewUser,
+		PlayCount:    playCount,
+		HighScore:    highScore,
+		MaxDepth:     maxDepth,
+	}
+
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+// AuthAdminRequest 管理者認証リクエストを表す。
+type AuthAdminRequest struct {
+	// Username ユーザー名
+	AdminID string `json:"adminId"`
+}
+
+// AuthAdminResponse 管理者認証レスポンスを表す。
+type AuthAdminResponse struct {
+	// SessionID セッション ID
+	SessionID string `json:"sessionId"`
+	// SessionToken セッショントークン
+	SessionToken string `json:"sessionToken"`
+}
+
+// authAdminHandler 管理者認証 API の HTTP ハンドラ。
+func (s *API) authAdminHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	req := &AuthAdminRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	if req.AdminID == "" {
+		writeErrorResponse(w, http.StatusBadRequest, "missing admin id")
+		return
+	}
+
+	var result bool
+
+	row := s.db.QueryRowContext(ctx, "SELECT 1 FROM administrators WHERE id = ?", req.AdminID)
+	if err := row.Scan(&result); errors.Is(sql.ErrNoRows, err) {
+		writeHTTPError(w, http.StatusUnauthorized)
+		return
+	} else if err != nil {
+		log.Printf("[ERROR] failed to get admin account: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	now := s.now()
+	sessID, token, err := s.auth.NewSessionToken(session.ClientTypeAdmin, req.AdminID, now)
+	if err != nil {
+		log.Printf("[ERROR] failed to generate session token: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		"UPDATE administrators SET session_id = ?, last_logged_in_at = ?, updated_at = ? WHERE id = ?",
+		sessID, now, now, req.AdminID); err != nil {
+		log.Printf("[ERROR] failed to update admin account: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	resp := &AuthAdminResponse{
+		SessionID:    sessID,
+		SessionToken: token,
+	}
+
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+// SaveResultRequest プレイ結果保存リクエストを表す。
+type SaveResultRequest struct {
+	PlayId    string `json:"playId"`
+	PlayCount int32  `json:"playCount`
+	Score     int32  `json:"score"`
+	Depth     int32  `json:"depth"`
+}
+
+// SaveResultResponse プレイ結果保存レスポンスを表す。
+type SaveResultResponse struct{}
+
+// saveResultHandler プレイ結果保存 API の HTTP ハンドラ。
+func (s *API) saveResultHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// ユーザー ID を取得する。
+	userID := session.UserID(ctx)
+	if userID == 0 {
+		writeErrorResponse(w, http.StatusBadRequest, "invalid session")
+		return
+	}
+
+	// 未実装 step3
+	req := &SaveResultRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	// req.playCount += 1
+	if _, err := s.db.ExecContext(ctx,
+		"UPDATE users SET play_count = ?, high_score = ?, max_depth = ? WHERE id = ?",
+		req.PlayCount, req.Score, req.Depth, userID); err != nil {
+		log.Printf("[ERROR] failed to update users save result: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	resp := &SaveResultResponse{}
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+// GetOwnAchievementsRequest アチーブメント取得リクエストを表す。
+type GetOwnAchievementsRequest struct{}
+
+// GetOwnAchievementsResponse アチーブメント取得レスポンスを表す。
+type GetOwnAchievementsResponse struct{}
+
+// getOwnAchievementsHandler アチーブメント取得 API の HTTP ハンドラ。
+func (s *API) getOwnAchievementsHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+}
+
+// UserSummary ユーザー概要を表す。
+type UserSummary struct {
+	// ID ユーザー ID
+	ID int32 `json:"id"`
+	// Name ユーザー名
+	Name string `json:"name"`
+	// CreatedAt 作成日時
+	CreatedAt time.Time `json:"createdAt"`
+	// UpdatedAt 更新日時
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// GetLatestUsersRequest 直近に更新されたユーザーの一覧取得リクエストを表す。
+type GetLatestUsersRequest struct{}
+
+// GetLatestUsersResponse 直近に更新されたユーザーの一覧取得レスポンスを表す。
+type GetLatestUsersResponse struct {
+	// Users ユーザー一覧
+	Users []*UserSummary `json:"users"`
+}
+
+// getLatestUsersHandler 直近に更新されたユーザーの一覧取得 API の HTTP ハンドラ。
+func (s *API) getLatestUsersHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	req := &GetLatestUsersRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	users, err := s.getLatestUsers(ctx)
+	if err != nil {
+		log.Printf("[ERROR] failed to get latest users: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+
+	resp := &GetLatestUsersResponse{
+		Users: users,
+	}
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+// getLatestUsers 直近に更新されたユーザーを最大 100 件取得する。
+func (s *API) getLatestUsers(ctx context.Context) ([]*UserSummary, error) {
+	query := "SELECT id, name, created_at, updated_at FROM users ORDER BY updated_at DESC LIMIT 100"
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("select latest users: %w", err)
+	}
+	defer rows.Close()
+
+	users := make([]*UserSummary, 0)
+	for rows.Next() {
+		v := &UserSummary{}
+		if err := rows.Scan(&v.ID, &v.Name, &v.CreatedAt, &v.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan latest users: %w", err)
+		}
+		users = append(users, v)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest users: %w", err)
+	}
+
+	return users, nil
+}
+
+// SearchUsersRequest ユーザー検索リクエストを表す。
+type SearchUsersRequest struct{}
+
+// SearchUsersResponse ユーザー検索レスポンスを表す。
+type SearchUsersResponse struct{}
+
+// searchUsersHandler ユーザー検索 API の HTTP ハンドラ。
+func (s *API) searchUsersHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+}
+
+// GetUserDataRequest ユーザーデータ取得リクエストを表す。
+type GetUserDataRequest struct{}
+
+// GetUserDataResponse ユーザーデータ取得レスポンスを表す。
+type GetUserDataResponse struct{}
+
+// getUserDataHandler ユーザーデータ取得 API の HTTP ハンドラ。
+func (s *API) getUserDataHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+}
+
+// GetUserAchievementsRequest 指定ユーザーの達成済みアチーブメント取得リクエストを表す。
+type GetUserAchievementsRequest struct{}
+
+// GetUserAchievementsResponse 指定ユーザーの達成済みアチーブメント取得レスポンスを表す。
+type GetUserAchievementsResponse struct{}
+
+// getUserAchievementsHandler 指定ユーザーの達成済みアチーブメント取得 API の HTTP ハンドラ。
+func (s *API) getUserAchievementsHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+}
+
+// GetUserPlayHistoryRequest プレイ履歴取得リクエストを表す。
+type GetUserPlayHistoryRequest struct{}
+
+// GetUserPlayHistoryResponse プレイ履歴取得レスポンスを表す。
+type GetUserPlayHistoryResponse struct{}
+
+// getUserPlayHistoryHandler プレイ履歴取得 API の HTTP ハンドラ。
+func (s *API) getUserPlayHistoryHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+}
+
+type Data struct {
+	UserId   int32  `json:"userId"`
+	UserName string `json:"username"`
+	Score    int32  `json:"score"`
+	Rank     int32  `json:"rank"`
+}
+
+// GetScoreRankingRequest スコアランキング取得リクエストを表す。
+type GetScoreRankingRequest struct{}
+
+// GetScoreRankingResponse スコアランキング取得レスポンスを表す。
+type GetScoreRankingResponse struct {
+	Data []*Data `json:"data"`
+}
+
+// getScoreRankingHandler スコアランキング取得 API の HTTP ハンドラ。
+func (s *API) getScoreRankingHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+	ctx := r.Context()
+
+	req := &GetScoreRankingRequest{}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	query := "SELECT id, name, high_score FROM users ORDER BY high_score LIMIT 10 DESC"
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		log.Printf("[ERROR] getScorerequest failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	defer rows.Close()
+	var a int = 0
+	datas := make([]*Data,4,4)
+	// b := 0
+	// old_score := 0
+	// score := 0
+	for rows.Next() {
+		v := &Data{}
+		a++
+		if err := rows.Scan(&v.UserId, &v.UserName, &v.Score); err != nil {
+			log.Printf("[ERROR] getScoreResponse failed: %+v", err)
+			writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		//datas[3] = a
+
+		datas = append(datas, v)
+
+	}
+	resp := &GetScoreRankingResponse{
+		Data: datas,
+	}
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+// GetDepthRankingRequest DEPTH ランキング取得リクエストを表す。
+type GetDepthRankingRequest struct{}
+
+// GetDepthRankingResponse DEPTH ランキング取得レスポンスを表す。
+type GetDepthRankingResponse struct {
+	Data []*Data `json:"data"`
+}
+
+// getDepthRankingHandler DEPTH ランキング取得 API の HTTP ハンドラ。
+func (s *API) getDepthRankingHandler(w http.ResponseWriter, r *http.Request) {
+	// 未実装
+	ctx := r.Context()
+
+	req := &GetScoreRankingRequest{}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] request decoding failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	query := "SELECT id, name, high_score FROM users ORDER BY max_depth LIMIT 10 DESC"
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		log.Printf("[ERROR] getScorerequest failed: %+v", err)
+		writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	defer rows.Close()
+	a := 0
+	datas := make([]*Data, a)
+	// b := 0
+	// old_score := 0
+	// score := 0
+	for rows.Next() {
+		v := &Data{}
+		a++
+
+		if err := rows.Scan(&v.UserId, &v.UserName, &v.Score); err != nil {
+			log.Printf("[ERROR] getScoreResponse failed: %+v", err)
+			writeErrorResponse(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		datas = append(datas, v)
+	}
+	resp := &GetScoreRankingResponse{
+		Data: datas,
+	}
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		log.Printf("[ERROR] response encoding failed: %+v", err)
+		writeHTTPError(w, http.StatusInternalServerError)
+		return
+	}
+}
+
+func (s *API) notFound(w http.ResponseWriter, _ *http.Request) {
+	writeHTTPError(w, http.StatusForbidden)
+}
+
+func (s *API) methodNotAllowed(w http.ResponseWriter, _ *http.Request) {
+	writeHTTPError(w, http.StatusForbidden)
+}
